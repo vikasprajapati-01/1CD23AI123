@@ -1,5 +1,6 @@
-const LOG_ENDPOINT = "http://20.244.56.144/evaluation-service/logs";
 require('dotenv').config();
+
+const LOG_ENDPOINT = "http://20.244.56.144/evaluation-service/logs";
 let TOKEN = process.env.TOKEN;
 
 function setToken(token) { 

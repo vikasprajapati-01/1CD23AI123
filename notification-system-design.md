@@ -254,3 +254,75 @@ This works because:
 - Uses `NOW() - INTERVAL '7 days'` to get the rolling 7-day window
 - `DISTINCT` avoids returning the same student multiple times if they
   got more than one placement notification
+
+## Stage 4
+
+### Problem
+
+Every page load triggers a DB query for every student. With 50,000 students
+actively using the platform, the database gets hammered with repeated reads
+for the same data — most of which hasn't even changed.
+
+### Solution 1 — Redis Caching
+
+Cache the notifications list per student in Redis after the first DB fetch.
+Subsequent requests hit Redis instead of the DB.
+
+```
+Request → Check Redis → Hit? Return cached data
+                      → Miss? Query DB → Store in Redis → Return data
+```
+
+Cache key: `notifications:student:<student_id>`
+TTL: 60 seconds (so data doesn't go stale for too long)
+
+**Tradeoffs:**
+- Pros - Drastically reduces DB load
+- Pros - Response time drops from ~200ms to ~5ms
+- Cons - Slight data staleness (up to TTL window)
+- Cons - Extra infrastructure to maintain (Redis server)
+- Cons - Cache invalidation needed when a notification is marked read or created
+
+Cache invalidation rule: whenever a notification is created or read for a
+student, delete their cache key so the next request re-fetches fresh data.
+
+```
+POST /notifications → insert to DB → delete Redis key for that student
+PATCH /notifications/:id/read → update DB → delete Redis key for that student
+```
+
+### Solution 2 — Pagination
+
+Instead of loading all notifications on every page load, fetch in small pages.
+
+```
+GET /notifications?studentId=1042&page=1&limit=20
+```
+
+The DB only reads 20 rows instead of potentially thousands.
+This alone reduces load significantly without any extra infrastructure.
+
+**Tradeoffs:**
+- Pros - Simple to implement, no extra services
+- Pros - Less data transferred per request
+- Cons - User has to scroll/click to load more
+- COns - Doesn't help if all 20 rows are queried on every single page load
+
+### Solution 3 — Read Replicas
+
+Spin up a read-only replica of the PostgreSQL DB. All SELECT queries go to
+the replica, all writes (INSERT, UPDATE) go to the primary.
+
+**Tradeoffs:**
+- Pros - Primary DB is free to handle writes only
+- Pros - Scales horizontally — can add more replicas under high read load
+- Cons - Replication lag means replica might be slightly behind primary
+- COns - More complex infrastructure and cost
+
+### Recommended Approach
+
+Use all three together in layers:
+
+1. **Pagination first** — cheapest win, implement immediately
+2. **Redis cache** — add once traffic grows, cache paginated results
+3. **Read replica** — add when a single DB instance can't keep up

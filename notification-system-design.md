@@ -326,3 +326,93 @@ Use all three together in layers:
 1. **Pagination first** — cheapest win, implement immediately
 2. **Redis cache** — add once traffic grows, cache paginated results
 3. **Read replica** — add when a single DB instance can't keep up
+
+## Stage 5
+
+### Original Pseudocode
+
+```
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)   # calls Email API
+        save_to_db(student_id, message)   # DB insert
+        push_to_app(student_id, message)  # SSE push
+```
+
+### What's wrong with this?
+
+1. **Sequential loop** — students are notified one by one. For 50,000
+   students this takes forever. If it fails at student 200, the remaining
+   49,800 get nothing.
+
+2. **No error handling** — if `send_email` fails for one student, the whole
+   loop crashes. No retry, no fallback.
+
+3. **Email and DB are coupled** — if the email API is slow, the DB insert
+   waits. If DB is slow, the email waits. They should be independent.
+
+4. **No feedback** — the HR clicking "Notify All" gets no response until
+   all 50,000 are processed, which could take minutes. The request will
+   likely timeout.
+
+### What happened at student 200?
+
+The email API probably hit a rate limit or timed out. Because there's no
+retry logic and the operations are sequential, everything after 200 just
+never ran.
+
+### Redesigned Approach — Message Queue
+
+Instead of processing inline, push all student IDs into a queue immediately
+and return a response to HR right away. Workers process the queue in the
+background with retries.
+
+```
+function notify_all(student_ids: array, message: string):
+    job_id = generate_uuid()
+    
+    # Push all jobs to queue in one shot — don't loop here
+    queue.push_batch([
+        { student_id: id, message: message, job_id: job_id }
+        for id in student_ids
+    ])
+    
+    return { status: "queued", job_id: job_id, total: len(student_ids) }
+
+
+# Worker runs separately — picks jobs from queue
+function worker(job):
+    try:
+        # Run email and DB in parallel, not sequential
+        parallel:
+            send_email(job.student_id, job.message)
+            save_to_db(job.student_id, job.message)
+        
+        push_to_app(job.student_id, job.message)
+        mark_job_done(job.job_id, job.student_id)
+
+    except error:
+        if job.retry_count < 3:
+            queue.push(job with retry_count + 1)  # retry
+        else:
+            log_failed(job.student_id, error)      # give up after 3 tries
+```
+
+### Should email and DB happen together?
+
+**Yes, but in parallel — not sequentially.**
+
+- They are independent operations, neither depends on the other's result
+- Running them in parallel cuts the time roughly in half per student
+- If email fails, DB still saves — student still sees in-app notification
+- If DB fails, we retry — email already sent is fine, duplicate guard handles it
+
+### Key improvements
+
+| Problem | Fix |
+|---------|-----|
+| Fails at student 200 | Each job is independent, failure doesn't stop others |
+| No retry | Queue retries up to 3 times before marking failed |
+| Sequential = slow | Workers run in parallel across many jobs |
+| HR waits forever | Returns immediately with job_id, HR can track progress |
+| Email + DB coupled | Both run in parallel inside each worker |

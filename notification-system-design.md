@@ -166,3 +166,91 @@ CREATE INDEX idx_notifications_student_id ON notifications(student_id);
 CREATE INDEX idx_notifications_created_at ON notifications(created_at DESC);
 CREATE INDEX idx_notifications_student_unread ON notifications(student_id, is_read);
 ```
+
+## Stage 3
+
+### Original Query
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+### Is this query accurate?
+
+Mostly yes — it fetches unread notifications for a student ordered by time.
+But there are problems with how it's written and how it performs at scale.
+
+### Why is it slow?
+
+1. **No index on studentID** — The DB scans every row in the table to find
+   matches. With 5,000,000 rows this is extremely slow.
+
+2. **SELECT \*** — Fetches every column including data the frontend doesn't
+   need. More data = more memory = slower response.
+
+3. **No LIMIT** — If a student has 10,000 unread notifications, all 10,000
+   are returned in one shot.
+
+### Fixed Query
+
+```sql
+SELECT id, student_id, type, message, created_at
+FROM notifications
+WHERE student_id = '1042' AND is_read = false
+ORDER BY created_at ASC
+LIMIT 50 OFFSET 0;
+```
+
+Changes made:
+- Selected only needed columns instead of `*`
+- Added `LIMIT` to avoid dumping thousands of rows
+- Used the correct snake_case column names matching the schema
+
+### Computation Cost (Before vs After)
+
+| | Before | After |
+|--|--------|-------|
+| Rows scanned | 5,000,000 | ~few hundred (index hit) |
+| Data transferred | All columns | 5 columns only |
+| Time (approx) | Seconds | Milliseconds |
+
+### Should we add indexes on every column?
+
+**No.** This is bad advice. Here's why:
+
+- Every index takes extra disk space
+- Every INSERT and UPDATE becomes slower because all indexes need updating
+- Most columns are never queried directly — indexing them wastes resources
+
+Only index columns that appear in WHERE, ORDER BY, or JOIN clauses frequently.
+
+### Correct indexes for this table
+
+```sql
+-- Already suggested in Stage 2, confirming they fix this query too
+CREATE INDEX idx_notifications_student_id ON notifications(student_id);
+CREATE INDEX idx_notifications_student_unread ON notifications(student_id, is_read);
+CREATE INDEX idx_notifications_created_at ON notifications(created_at DESC);
+```
+
+The composite index on `(student_id, is_read)` directly speeds up this query
+because both columns appear in the WHERE clause together.
+
+### Query — Placement notifications in last 7 days
+
+Find all students who got a placement notification in the last 7 days:
+
+```sql
+SELECT DISTINCT student_id
+FROM notifications
+WHERE type = 'Placement'
+AND created_at >= NOW() - INTERVAL '7 days';
+```
+
+This works because:
+- Filters by `type = 'Placement'` using the enum we defined
+- Uses `NOW() - INTERVAL '7 days'` to get the rolling 7-day window
+- `DISTINCT` avoids returning the same student multiple times if they
+  got more than one placement notification
